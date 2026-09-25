@@ -92,12 +92,24 @@ class WorkbookTests(WorkbookFixture, unittest.TestCase):
             ("MAX_SHEETS", 1, "工作表超过"),
             ("MAX_ROWS", 2, "行或"),
             ("MAX_COLUMNS", 2, "列限制"),
-            ("MAX_CELLS", 5, "累计显示区域"),
             ("MAX_TEXT_CHARS", 2, "显示文本"),
         ]:
             with self.subTest(limit=name), patch.object(loader, name, value):
                 with self.assertRaisesRegex(loader.ViewerError, message):
                     loader.read_workbook(self.path)
+
+    def test_more_than_100000_cells_can_be_viewed(self):
+        book = Workbook()
+        sheet = book.active
+        sheet["A1"] = "start"
+        sheet.cell(row=400, column=256, value="end")
+        book.save(self.path)
+        book.close()
+
+        sheets = loader.read_workbook(self.path)
+
+        self.assertEqual(len(sheets[0]["rows"]) * sheets[0]["columns"], 102400)
+        self.assertEqual(sheets[0]["rows"][399][255], "end")
 
     def test_understated_dimensions_do_not_bypass_limits(self):
         self.make_book()

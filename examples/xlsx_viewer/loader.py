@@ -14,7 +14,6 @@ MAX_ZIP_ENTRIES = 2000
 MAX_SHEETS = 100
 MAX_ROWS = 10000
 MAX_COLUMNS = 256
-MAX_CELLS = 100000  # Includes blank cells inside each sheet's rectangle.
 MAX_TEXT_CHARS = 1000000
 OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
@@ -73,7 +72,6 @@ def read_workbook(filename):
                 if len(workbook.worksheets) > MAX_SHEETS:
                     raise ViewerError("工作表超过 100 张限制。")
                 sheets = []
-                total_cells = 0
                 total_text = 0
                 for sheet in workbook.worksheets:
                     if ((sheet.max_row or 0) > MAX_ROWS or
@@ -87,14 +85,11 @@ def read_workbook(filename):
                         width = max(width, len(row))
                         if len(rows) >= MAX_ROWS or width > MAX_COLUMNS:
                             raise ViewerError(f"工作表“{sheet.title}”超过 10000 行或 256 列限制。")
-                        if total_cells + (len(rows) + 1) * width > MAX_CELLS:
-                            raise ViewerError("工作簿累计显示区域超过 100000 个单元格限制（含区域内空白）。")
                         values = [_display_value(cell.value) for cell in row]
                         total_text += sum(len(value) for value in values)
                         if total_text > MAX_TEXT_CHARS:
                             raise ViewerError("工作簿显示文本超过 1000000 字符限制。")
                         rows.append(values)
-                    total_cells += len(rows) * width
                     sheets.append({"name": sheet.title, "rows": rows, "columns": width})
                 return sheets
             finally:
