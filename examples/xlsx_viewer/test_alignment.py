@@ -1,5 +1,6 @@
 """Headless tests for conservative alignment and Save As verification."""
 from pathlib import Path
+import json
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -8,7 +9,8 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
 from openpyxl.styles import Font
 
-from alignment import analyze, apply, fingerprint, ViewerError, validate_destination
+from alignment import (analyze, apply, fingerprint, ViewerError, validate_destination,
+                       descriptors, order_advisories)
 
 
 class AlignmentTests(unittest.TestCase):
@@ -47,6 +49,101 @@ class AlignmentTests(unittest.TestCase):
         book.save(self.source)
         book.close()
         self.assertEqual(len(analyze(self.source)['groups']), 2)
+
+    def test_advisories_evidence_is_read_only_and_json_stable(self):
+        self.fixture()
+        book = load_workbook(self.source)
+        ws = book['甲']
+        ws['A6'] = '独立业务说明'
+        ws['C4'], ws['D4'] = '实际', '预测'
+        ws['D6'] = '=C6*1.05'
+        ws['E6'], ws['F6'], ws['G6'] = 0, True, '123'
+        other = book.copy_worksheet(ws)
+        other.title = '其他实例'
+        book.save(self.source)
+        book.close()
+        before = fingerprint(self.source)
+        scope = {'0': {'sheets': ['甲', '乙']}}
+        result = analyze(self.source, scope)
+        self.assertEqual(result, json.loads(json.dumps(result, allow_nan=False)))
+        self.assertEqual(result, analyze(self.source, scope))
+        self.assertEqual(before, fingerprint(self.source))
+        advice = result['groups'][0]['advisories'][0]
+        self.assertFalse(advice['target_has_same_label'])
+        self.assertIn('禁止复制别家值', advice['recommendation'])
+        self.assertEqual([e['sheet'] for e in advice['evidence']], ['甲', '其他实例'])
+        evidence = advice['evidence'][0]
+        self.assertEqual((evidence['cell'], evidence['description']), ('B6', '独立业务说明'))
+        self.assertTrue(evidence['has_nonzero'])
+        self.assertTrue(evidence['has_formula'])
+        cells = {c['cell']: c for c in evidence['cells']}
+        self.assertEqual(cells['D6']['value'], '=C6*1.05')
+        self.assertEqual(cells['D6']['header'], '预测')
+        self.assertIsNone(cells['D6']['nonzero'])
+        self.assertIs(cells['E6']['nonzero'], False)
+        self.assertIsNone(cells['F6']['nonzero'])
+        self.assertIsNone(cells['G6']['nonzero'])
+
+    def test_same_label_other_context_is_not_missing_business(self):
+        complete = ['分部一', '人员', '收入', '分部二', '人员', '利润', '现金', '期末']
+        short = complete[:4] + complete[5:]
+        self.fixture([complete, short])
+        items = analyze(self.source)['groups'][0]['advisories']
+        item = next(a for a in items if a['kind'] == 'insertion' and a['target_sheet'] == '乙')
+        self.assertTrue(item['target_has_same_label'])
+        self.assertEqual(item['target_instances'][0]['row'], 6)
+        self.assertIn('上下文不同', item['recommendation'])
+
+    def test_nonzero_terminology_never_implies_equivalence(self):
+        base = ['收入', '成本', '设备租赁', '现金', '期末', '资产', '负债', '权益', '总计']
+        variant = base.copy()
+        variant[2] = '技术服务'
+        self.fixture([base, variant])
+        group = analyze(self.source)['groups'][0]
+        item = next(a for a in group['advisories'] if a['kind'] == 'terminology')
+        self.assertIn('存在非零业务数据', item['recommendation'])
+        self.assertIn('不建议视为同义词', item['recommendation'])
+        self.assertEqual(group['equivalences'], [])
+        self.assertTrue(group['blockers'])
+        book = load_workbook(self.source)
+        for ws in book:
+            ws['C7'] = '=1-1'
+        book.save(self.source)
+        book.close()
+        item = next(a for a in analyze(self.source)['groups'][0]['advisories'] if a['kind'] == 'terminology')
+        self.assertNotIn('存在非零业务数据', item['recommendation'])
+        self.assertIn('默认按不等价', item['recommendation'])
+
+    def test_order_majority_tie_and_subset(self):
+        base = ['收入', '工资', '社保', '其他', '利润', '现金', '期末', '资产', '总计']
+        variant = base.copy()
+        variant[2:4] = reversed(variant[2:4])
+        self.fixture([base, variant])
+        book = load_workbook(self.source)
+        book.copy_worksheet(book['甲']).title = '丙'
+        book.save(self.source)
+        book.close()
+        group = analyze(self.source)['groups'][0]
+        item = next(a for a in group['advisories'] if a['kind'] == 'order')
+        self.assertEqual([k[0] for k in item['majority']], ['社保', '其他'])
+        self.assertIn('乙：建议人工核对后将原行 8', item['recommendation'])
+        self.assertTrue(any(e['has_nonzero'] for e in item['evidence']))
+        self.assertFalse(group['actions'])
+        tied = analyze(self.source, {'0': {'sheets': ['甲', '乙']}})['groups'][0]
+        item = next(a for a in tied['advisories'] if a['kind'] == 'order')
+        self.assertIsNone(item['majority'])
+        self.assertIn('票数相同', item['recommendation'])
+        same = analyze(self.source, {'0': {'sheets': ['甲', '丙']}})['groups'][0]
+        self.assertEqual(same['advisories'], [])
+
+    def test_multi_sheet_cycle_without_direct_inversion(self):
+        sheets = [descriptors({'name': str(i), 'rows': [['项目名称'], *[[x] for x in labels]]})
+                  for i, labels in enumerate((['甲', '乙'], ['乙', '丙'], ['丙', '甲']))]
+        items = order_advisories(sheets, {})
+        self.assertEqual(items[0]['kind'], 'order_cycle')
+        self.assertEqual(items[0]['labels'], ['甲', '乙', '丙', '甲'])
+        self.assertEqual(len(items[0]['links']), 3)
+        self.assertEqual(items[0]['links'][0]['sources'], [{'sheet': '0', 'rows': [2, 3]}])
 
     def test_repeated_context_and_ambiguity(self):
         labels = ['分部一', '人员工资', '收入', '分部二', '人员工资', '利润']

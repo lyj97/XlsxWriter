@@ -245,6 +245,10 @@ class QtTests(WorkbookFixture, unittest.TestCase):
         self.wait_until(lambda: self.window.job is None)
         self.assertEqual(self.window.actions.rowCount(), 1)
         self.assertTrue(self.window.save_button.isEnabled())
+        self.assertTrue(self.window.report.isReadOnly())
+        self.assertIn('禁止复制别家值', self.window.report.toPlainText())
+        self.assertIn('Sheet!B6', self.window.report.toPlainText())
+        self.assertIn('非零数值常量：有', self.window.report.toPlainText())
         item = self.window.actions.item(0, 0)
         item.setCheckState(Qt.CheckState.Unchecked)
         self.assertFalse(self.window.save_button.isEnabled())
@@ -275,13 +279,18 @@ class QtTests(WorkbookFixture, unittest.TestCase):
         self.window.start_analysis()
         self.wait_until(lambda: self.window.job is None)
         self.assertFalse(self.window.save_button.isEnabled())
+        self.assertIn('顺序冲突：', self.window.report.toPlainText())
+        self.assertIn('原行', self.window.report.toPlainText())
         self.window.members.item(2, 0).setCheckState(Qt.CheckState.Unchecked)
+        self.assertIn('旧建议已失效', self.window.report.toPlainText())
         self.assertTrue(self.window.regenerate_button.isEnabled())
         self.window.regenerate_plan()
         self.wait_until(lambda: self.window.job is None)
         self.assertEqual(self.window.analysis['groups'][0]['sheets'], ['Sheet', '1'])
         self.assertEqual(self.window.actions.rowCount(), 1)
         self.assertTrue(self.window.save_button.isEnabled())
+        self.assertIn('插入候选：成本', self.window.report.toPlainText())
+        self.assertNotIn('顺序冲突：', self.window.report.toPlainText())
         self.window.members.item(1, 0).setCheckState(Qt.CheckState.Unchecked)
         self.assertFalse(self.window.regenerate_button.isEnabled())
         self.assertFalse(self.window.save_button.isEnabled())
@@ -300,6 +309,28 @@ class QtTests(WorkbookFixture, unittest.TestCase):
         self.wait_until(lambda: self.window.job is None)
         self.assertIn('结构一致', self.window.summary.text())
         self.assertFalse(self.window.save_button.isEnabled())
+
+    def test_terminology_evidence_display_does_not_confirm(self):
+        from alignment import analyze
+        from viewer import advisory_text
+        book = Workbook()
+        base = ['收入', '成本', '租赁', '现金', '期末', '资产', '负债', '权益', '总计']
+        for ws, label in ((book.active, '租赁'), (book.create_sheet('乙'), '服务')):
+            ws.append(['说明', '项目名称', '实际', '预测'])
+            for name in base:
+                ws.append(['<独立业务>', label if name == '租赁' else name, 10, '=C2*1.05'])
+        book.save(self.path)
+        book.close()
+        self.window.analysis = analyze(self.path)
+        self.window.groups.addItem('测试组')
+        text = self.window.report.toPlainText()
+        self.assertIn('不建议视为同义词', text)
+        self.assertIn('A列描述：<独立业务>', text)
+        self.assertIn('[预测]：=C2*1.05', text)
+        self.assertIn('结果未知', text)
+        self.assertEqual(self.window.equivalences.item(0, 0).checkState(), Qt.CheckState.Unchecked)
+        self.assertFalse(self.window.save_button.isEnabled())
+        self.assertIn('当前计划无差异建议', advisory_text({}))
 
     def test_alignment_cancel_cleans_staging(self):
         self.window.job = "apply"

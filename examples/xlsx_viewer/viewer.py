@@ -18,6 +18,35 @@ from PySide6.QtWidgets import (
 LOAD_TIMEOUT_MS = 30000
 
 
+def advisory_text(group):
+    lines = ['差异分析 / 处理意见（只读，不自动执行）',
+             '数值仅统计项目名称右侧的数值常量；公式不计算，结果未知。列标题供核对实际/预测口径，不自动推断业务语义。',
+             '同名实例来自当前工作簿可识别项目表；不代表主体业务的完整检索。']
+    kinds = {'insertion': '插入候选', 'terminology': '术语候选',
+             'order': '顺序冲突', 'order_cycle': '跨表顺序循环'}
+    for item in group.get('advisories', []):
+        lines.append('\n' + kinds[item['kind']] + '：' + ' / '.join(item['labels']))
+        if item['kind'] == 'insertion':
+            lines.append(f"目标：{item['target_sheet']}；同名行：" +
+                         ('存在' if item['target_has_same_label'] else '未发现'))
+        for vote in item.get('votes', []):
+            lines.append(f"顺序证据 {vote['sheet']}：上述两字段原行 {vote['rows'][0]} / {vote['rows'][1]}")
+        for link in item.get('links', []):
+            lines.append(' → '.join(k[0] for k in link['keys']) + '：' + '；'.join(
+                f"{s['sheet']} 原行 {s['rows'][0]} → {s['rows'][1]}" for s in link['sources']))
+        lines.append('处理意见：' + item['recommendation'])
+        for evidence in item['evidence']:
+            lines.append(f"  {evidence['sheet']}!{evidence['cell']}（原行 {evidence['row']}）"
+                         f" {evidence['label']}；上下文：{evidence['context']}；A列描述：{evidence['description'] or '未提供'}")
+            lines.append('  非零数值常量：' + ('有' if evidence['has_nonzero'] else '未发现') +
+                         '；公式：' + ('有（结果未知）' if evidence['has_formula'] else '无'))
+            for cell in evidence['cells']:
+                lines.append(f"    {cell['cell']} [{cell['header'] or '无列标题'}]：{cell['value']}")
+    if not group.get('advisories'):
+        lines.append('当前计划无差异建议。')
+    return '\n'.join(lines)
+
+
 def column_title(index):
     title = ""
     index += 1
@@ -137,7 +166,7 @@ class Viewer(QMainWindow):
         self.summary.setTextFormat(Qt.TextFormat.PlainText)
         self.report = QTextEdit()
         self.report.setReadOnly(True)
-        self.report.setMaximumHeight(110)
+        self.report.setMinimumHeight(130)
         self.report.setPlainText("仅支持保守的精确顺序并集；勾选部分操作时不保证完整对齐。\n"
                                  "openpyxl 无法保证绘图、外部链接等 Excel 对象完整往返。请保留原件并在 Excel 中复核。")
         review = QWidget()
@@ -205,6 +234,7 @@ class Viewer(QMainWindow):
         self.groups.clear()
         self.actions.setRowCount(0)
         self.summary.setText("未分析")
+        self.report.setPlainText("未分析")
         self.analyze_button.setEnabled(False)
         self.save_button.setEnabled(False)
         self.filename = str(filename)
@@ -321,10 +351,12 @@ class Viewer(QMainWindow):
         self.analysis = None
         self.groups.clear()
         self.actions.setRowCount(0)
+        self.report.setPlainText("正在分析，旧建议已清除。")
         self._start_job({"mode": "analyze", "source": self.filename})
 
     def scope_changed(self, *args):
         self.scope_dirty = True
+        self.report.setPlainText("选择已更改，旧建议已失效；请重新生成计划。")
         self.save_button.setEnabled(False)
         count = sum(self.members.item(i, 0).checkState() == Qt.CheckState.Checked
                     for i in range(self.members.rowCount()))
@@ -405,7 +437,10 @@ class Viewer(QMainWindow):
                           action["label"] + " / " + action["context"], action["confidence"], action["reason"]]
                 for c, value in enumerate(values, 1):
                     self.actions.setItem(i, c, QTableWidgetItem(str(value)))
-            self.report.setPlainText("\n".join(group["blockers"]) or self.analysis["warning"])
+            self.report.setPlainText(("\n".join(group["blockers"]) or self.analysis["warning"]) +
+                                     "\n\n" + advisory_text(group))
+        else:
+            self.report.setPlainText("未分析或无可对齐工作表。")
         for table in (self.members, self.equivalences):
             table.blockSignals(False)
         self.actions.blockSignals(False)
