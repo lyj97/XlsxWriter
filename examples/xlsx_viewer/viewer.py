@@ -1,6 +1,8 @@
-"""Local, read-only Excel viewer. Run with: python viewer.py"""
+"""Local Excel structure alignment and viewing application."""
 
 import json
+import os
+import tempfile
 from pathlib import Path
 import sys
 
@@ -8,7 +10,7 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, QProcess, Qt, QTime
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QFileDialog, QHBoxLayout,
     QLabel, QMainWindow, QMessageBox, QPushButton, QTableView, QVBoxLayout,
-    QWidget,
+    QWidget, QSplitter, QTableWidget, QTableWidgetItem, QTextEdit,
 )
 
 
@@ -53,7 +55,7 @@ class SheetModel(QAbstractTableModel):
 class Viewer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Excel 查看器（只读）")
+        self.setWindowTitle("Excel 结构对齐工具")
         self.resize(1000, 700)
         self.sheets = []
         self.model = None
@@ -80,12 +82,79 @@ class Viewer(QMainWindow):
         controls.addStretch()
         layout = QVBoxLayout()
         layout.addLayout(controls)
-        layout.addWidget(self.table)
+        self.analysis = None
+        self.staging = None
+        self.job = None
+        self.analyze_button = QPushButton("分析结构")
+        self.analyze_button.setEnabled(False)
+        self.groups = QComboBox()
+        self.scope_dirty = False
+        self.regenerate_button = QPushButton("重新生成计划")
+        self.regenerate_button.setEnabled(False)
+        self.members = QTableWidget(0, 1)
+        self.members.setHorizontalHeaderLabels(["参与对齐的工作表（至少两张）"])
+        self.members.setMaximumHeight(120)
+        self.equivalences = QTableWidget(0, 2)
+        self.equivalences.setHorizontalHeaderLabels(["视为同一项目", "候选原因（不修改原标签）"])
+        self.equivalences.setMaximumHeight(100)
+        self.equivalences.setColumnWidth(0, 380)
+        for table in (self.members, self.equivalences):
+            table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            table.horizontalHeader().setStretchLastSection(True)
+        self.save_button = QPushButton("另存对齐副本…")
+        self.save_button.setEnabled(False)
+        self.cancel_job_button = QPushButton("取消任务")
+        self.cancel_job_button.setEnabled(False)
+        review_controls = QHBoxLayout()
+        for widget in (self.analyze_button, self.groups, self.regenerate_button, self.save_button, self.cancel_job_button):
+            review_controls.addWidget(widget)
+        self.actions = QTableWidget(0, 8)
+        self.actions.setHorizontalHeaderLabels(["应用", "工作表", "操作", "源行", "预计新行", "项目 / 上下文", "置信度", "原因"])
+        self.actions.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.actions.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.actions.horizontalHeader().setStretchLastSection(True)
+        self.summary = QLabel("未分析")
+        self.summary.setWordWrap(True)
+        self.summary.setTextFormat(Qt.TextFormat.PlainText)
+        self.report = QTextEdit()
+        self.report.setReadOnly(True)
+        self.report.setMaximumHeight(110)
+        self.report.setPlainText("仅支持保守的精确顺序并集；勾选部分操作时不保证完整对齐。\n"
+                                 "openpyxl 无法保证绘图、外部链接等 Excel 对象完整往返。请保留原件并在 Excel 中复核。")
+        review = QWidget()
+        review_layout = QVBoxLayout(review)
+        review_layout.addLayout(review_controls)
+        review_layout.addWidget(QLabel("一次另存仅应用当前组的所选工作表；其他组需打开副本后继续。"))
+        review_layout.addWidget(self.members)
+        review_layout.addWidget(self.equivalences)
+        review_layout.addWidget(self.summary)
+        review_layout.addWidget(self.actions)
+        review_layout.addWidget(self.report)
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(self.table)
+        splitter.addWidget(review)
+        splitter.setSizes([400, 300])
+        layout.addWidget(splitter)
         layout.addWidget(self.status)
         central = QWidget()
         central.setLayout(layout)
         self.setCentralWidget(central)
 
+        self.worker = QProcess(self)
+        self.worker.finished.connect(self._job_finished)
+        self.worker.errorOccurred.connect(self._job_error)
+        self.job_timer = QTimer(self)
+        self.job_timer.setSingleShot(True)
+        self.job_timer.timeout.connect(lambda: self.cancel_job("失败：任务超时，已停止（分析 120 秒，保存 10 分钟）。"))
+        self.analyze_button.clicked.connect(self.start_analysis)
+        self.regenerate_button.clicked.connect(self.regenerate_plan)
+        self.members.itemChanged.connect(self.scope_changed)
+        self.equivalences.itemChanged.connect(self.scope_changed)
+        self.groups.currentIndexChanged.connect(self.show_plan)
+        self.actions.itemChanged.connect(self.selection_changed)
+        self.actions.cellClicked.connect(self.navigate_action)
+        self.save_button.clicked.connect(self.save_aligned)
+        self.cancel_job_button.clicked.connect(lambda: self.cancel_job("未完成：任务已取消。"))
         self.process = QProcess(self)
         self.process.finished.connect(self._finished)
         self.process.errorOccurred.connect(self._process_error)
@@ -106,6 +175,14 @@ class Viewer(QMainWindow):
     def load_file(self, filename):
         if self.process.state() != QProcess.ProcessState.NotRunning:
             return
+        if self.worker.state() != QProcess.ProcessState.NotRunning:
+            return
+        self.analysis = None
+        self.groups.clear()
+        self.actions.setRowCount(0)
+        self.summary.setText("未分析")
+        self.analyze_button.setEnabled(False)
+        self.save_button.setEnabled(False)
         self.filename = str(filename)
         self.failure = None
         self.open_button.setEnabled(False)
@@ -115,7 +192,7 @@ class Viewer(QMainWindow):
         self.sheets = []
         self.table.setModel(None)
         self.model = None
-        self.setWindowTitle("Excel 查看器（只读）")
+        self.setWindowTitle("Excel 结构对齐工具")
         self.status.setText("正在加载…最多等待 30 秒，可随时取消。")
         worker = str(Path(__file__).with_name("loader.py"))
         self.timer.start(LOAD_TIMEOUT_MS)
@@ -164,7 +241,8 @@ class Viewer(QMainWindow):
             return
         self.selector.addItems([sheet["name"] for sheet in self.sheets])
         self.selector.setEnabled(True)
-        self.setWindowTitle(f"{Path(self.filename).name} — Excel 查看器（只读）")
+        self.analyze_button.setEnabled(True)
+        self.setWindowTitle(f"{Path(self.filename).name} — Excel 结构对齐工具")
 
     def show_sheet(self, index):
         if not 0 <= index < len(self.sheets):
@@ -176,7 +254,210 @@ class Viewer(QMainWindow):
         detail = f"{rows} 行 × {columns} 列" if rows else "空工作表"
         self.status.setText(f"{sheet['name']}：{detail}。只读；公式显示为文本。")
 
+    def start_analysis(self):
+        self.analysis = None
+        self.groups.clear()
+        self.actions.setRowCount(0)
+        self._start_job({"mode": "analyze", "source": self.filename})
+
+    def scope_changed(self, *args):
+        self.scope_dirty = True
+        self.save_button.setEnabled(False)
+        count = sum(self.members.item(i, 0).checkState() == Qt.CheckState.Checked
+                    for i in range(self.members.rowCount()))
+        self.regenerate_button.setEnabled(count >= 2 and self.job is None)
+        self.summary.setText("选择已更改，请重新生成计划。" if count >= 2 else "请至少选择两张候选工作表。")
+
+    def regenerate_plan(self):
+        if not self.regenerate_button.isEnabled():
+            return
+        index = self.groups.currentIndex()
+        scopes = dict(self.analysis.get("scopes", {}))
+        scopes[str(index)] = {
+            "sheets": [self.members.item(i, 0).text() for i in range(self.members.rowCount())
+                       if self.members.item(i, 0).checkState() == Qt.CheckState.Checked],
+            "equivalences": [self.equivalences.item(i, 0).data(Qt.ItemDataRole.UserRole)
+                             for i in range(self.equivalences.rowCount())
+                             if self.equivalences.item(i, 0).checkState() == Qt.CheckState.Checked]}
+        # Changing sheets invalidates old terminology candidates; regenerate them first.
+        if scopes[str(index)]["sheets"] != self.analysis["groups"][index]["sheets"]:
+            scopes[str(index)]["equivalences"] = []
+        self._start_job({"mode": "analyze", "source": self.filename, "scopes": scopes})
+
+    def _start_job(self, request):
+        self.review_index = max(0, self.groups.currentIndex())
+        self.job = request["mode"]
+        self.regenerate_button.setEnabled(False)
+        self.members.setEnabled(False)
+        self.equivalences.setEnabled(False)
+        self.job_failure = None
+        self.open_button.setEnabled(False)
+        self.analyze_button.setEnabled(False)
+        self.save_button.setEnabled(False)
+        self.groups.setEnabled(False)
+        self.actions.setEnabled(False)
+        self.cancel_job_button.setEnabled(True)
+        self.summary.setText("正在分析…" if self.job == "analyze" else "正在保存并验证临时副本…")
+        self.worker.start(sys.executable, [str(Path(__file__).with_name("alignment.py"))])
+        self.worker.write(json.dumps(request, ensure_ascii=False).encode("utf-8"))
+        self.worker.closeWriteChannel()
+        self.job_timer.start(120000 if self.job == "analyze" else 600000)
+
+    def selected_actions(self):
+        return [i for i in range(self.actions.rowCount())
+                if self.actions.item(i, 0).checkState() == Qt.CheckState.Checked]
+
+    def show_plan(self, index):
+        self.scope_dirty = False
+        for table in (self.members, self.equivalences):
+            table.blockSignals(True)
+            table.setRowCount(0)
+        self.actions.blockSignals(True)
+        self.actions.setRowCount(0)
+        if self.analysis and 0 <= index < len(self.analysis["groups"]):
+            group = self.analysis["groups"][index]
+            for name in group["members"]:
+                i = self.members.rowCount()
+                self.members.insertRow(i)
+                item = QTableWidgetItem(name)
+                item.setCheckState(Qt.CheckState.Checked if name in group["sheets"] else Qt.CheckState.Unchecked)
+                self.members.setItem(i, 0, item)
+            for candidate in group["candidates"]:
+                i = self.equivalences.rowCount()
+                self.equivalences.insertRow(i)
+                item = QTableWidgetItem(" = ".join(candidate["labels"]))
+                item.setData(Qt.ItemDataRole.UserRole, candidate["labels"])
+                item.setCheckState(Qt.CheckState.Checked if candidate["labels"] in group["equivalences"] else Qt.CheckState.Unchecked)
+                self.equivalences.setItem(i, 0, item)
+                self.equivalences.setItem(i, 1, QTableWidgetItem(candidate["reason"]))
+            self.regenerate_button.setEnabled(len(group["sheets"]) >= 2 and self.job is None)
+            self.actions.setRowCount(len(group["actions"]))
+            for i, action in enumerate(group["actions"]):
+                check = QTableWidgetItem()
+                check.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable |
+                               (Qt.ItemFlag.ItemIsUserCheckable if not action["blocking"] else Qt.ItemFlag.NoItemFlags))
+                check.setCheckState(Qt.CheckState.Checked if action["selected"] else Qt.CheckState.Unchecked)
+                self.actions.setItem(i, 0, check)
+                values = [action["sheet"], "插入模板行", action["old_row"], action["new_row"],
+                          action["label"] + " / " + action["context"], action["confidence"], action["reason"]]
+                for c, value in enumerate(values, 1):
+                    self.actions.setItem(i, c, QTableWidgetItem(str(value)))
+            self.report.setPlainText("\n".join(group["blockers"]) or self.analysis["warning"])
+        for table in (self.members, self.equivalences):
+            table.blockSignals(False)
+        self.actions.blockSignals(False)
+        self.selection_changed()
+
+    def selection_changed(self, *args):
+        index = self.groups.currentIndex()
+        valid = self.analysis and 0 <= index < len(self.analysis["groups"])
+        if not valid:
+            self.save_button.setEnabled(False)
+            return
+        group = self.analysis["groups"][index]
+        count = len(self.selected_actions())
+        blocked = bool(group["blockers"])
+        self.summary.setText(("已阻断" if blocked else "发现差异" if group["actions"] else "结构一致") +
+                             f"；操作 {len(group['actions'])}，已选 {count}，阻断 {len(group['blockers'])}。新行号按完整选择预览。")
+        self.save_button.setEnabled(bool(count and not blocked and not self.scope_dirty and self.job is None))
+
+    def navigate_action(self, row, column):
+        group = self.analysis["groups"][self.groups.currentIndex()]
+        action = group["actions"][row]
+        self.selector.setCurrentText(action["sheet"])
+        if self.model and self.model.rowCount():
+            index = self.model.index(min(action["old_row"] - 1, self.model.rowCount() - 1), action["column"] - 1)
+            self.table.setCurrentIndex(index)
+            self.table.selectRow(index.row())
+            self.table.scrollTo(index)
+
+    def save_aligned(self):
+        if not self.save_button.isEnabled():
+            return
+        from alignment import validate_destination
+        filename, _ = QFileDialog.getSaveFileName(self, "另存对齐副本（选择新文件名）", "",
+                                                 f"Excel (*{Path(self.filename).suffix})")
+        if not filename:
+            return
+        try:
+            self.destination = validate_destination(self.filename, filename)
+            fd, staging = tempfile.mkstemp(prefix=".alignment-", suffix=self.destination.suffix,
+                                           dir=self.destination.parent)
+            os.close(fd)
+            self.staging = Path(staging)
+            self._start_job({"mode": "apply", "source": self.filename, "destination": str(self.destination),
+                             "staging": staging, "analysis": self.analysis,
+                             "group": self.groups.currentIndex(), "selected": self.selected_actions()})
+        except Exception as exc:
+            self.summary.setText("失败：" + str(exc))
+            self._cleanup_staging()
+
+    def cancel_job(self, message):
+        self.job_failure = message
+        self.worker.kill()
+
+    def _cleanup_staging(self):
+        if self.staging:
+            self.staging.unlink(missing_ok=True)
+            self.staging = None
+
+    def _job_error(self, error):
+        if error == QProcess.ProcessError.FailedToStart:
+            self.job_failure = "失败：无法启动工作进程。"
+            self._job_finished(1, QProcess.ExitStatus.CrashExit)
+
+    def _job_finished(self, code, status):
+        from alignment import validate_destination, fingerprint
+        self.job_timer.stop()
+        mode, self.job = self.job, None
+        self.open_button.setEnabled(True)
+        self.analyze_button.setEnabled(bool(self.sheets))
+        self.groups.setEnabled(True)
+        self.actions.setEnabled(True)
+        self.members.setEnabled(True)
+        self.equivalences.setEnabled(True)
+        self.cancel_job_button.setEnabled(False)
+        output = bytes(self.worker.readAllStandardOutput())
+        self.worker.readAllStandardError()
+        try:
+            if self.job_failure:
+                raise ValueError(self.job_failure)
+            if code or status != QProcess.ExitStatus.NormalExit:
+                raise ValueError("工作进程异常退出。")
+            response = json.loads(output)
+            if "error" in response:
+                raise ValueError(response["error"])
+            result = response["result"]
+            if mode == "analyze":
+                self.analysis = result
+                self.groups.blockSignals(True)
+                self.groups.clear()
+                self.groups.addItems([" / ".join(g["members"]) for g in result["groups"]])
+                self.groups.setCurrentIndex(min(self.review_index, len(result["groups"]) - 1))
+                self.groups.blockSignals(False)
+                self.show_plan(self.groups.currentIndex())
+                if not result["groups"]:
+                    self.summary.setText("分析完成：未发现可对齐表头。")
+            else:
+                validate_destination(self.filename, self.destination)
+                if fingerprint(self.filename) != self.analysis["sha256"]:
+                    raise ValueError("源文件已变化；未发布副本。")
+                os.replace(self.staging, self.destination)
+                self.staging = None
+                self.summary.setText("已保存并验证：" + str(self.destination))
+                self.report.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))
+        except Exception as exc:
+            self.summary.setText("失败：" + str(exc))
+            self.report.setPlainText(str(exc))
+        finally:
+            self._cleanup_staging()
+
     def closeEvent(self, event):
+        self.job_timer.stop()
+        self.job_failure = "已关闭。"
+        self.worker.kill()
+        self.worker.waitForFinished(1000)
+        self._cleanup_staging()
         self.timer.stop()
         self.failure = "已停止加载。"
         self.process.kill()

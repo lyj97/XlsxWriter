@@ -199,6 +199,93 @@ class QtTests(WorkbookFixture, unittest.TestCase):
                 self.assertEqual(self.window.process.state(), QProcess.ProcessState.NotRunning)
                 self.assertIn(expected, self.window.status.text())
 
+    def test_alignment_review_save_and_verified_output(self):
+        book = Workbook()
+        for i, labels in enumerate((["收入", "成本", "利润", "现金", "期末"],
+                                    ["收入", "利润", "现金", "期末"])):
+            sheet = book.active if i == 0 else book.create_sheet("乙")
+            sheet["B4"] = "项目名称"
+            for row, label in enumerate(labels, 5):
+                sheet.cell(row, 2, label)
+                sheet.cell(row, 3, row * 10)
+        book.save(self.path)
+        book.close()
+        self.window.load_file(self.path)
+        self.wait_until(lambda: self.window.open_button.isEnabled())
+        self.assertFalse(self.window.save_button.isEnabled())
+        self.window.start_analysis()
+        self.wait_until(lambda: self.window.job is None)
+        self.assertEqual(self.window.actions.rowCount(), 1)
+        self.assertTrue(self.window.save_button.isEnabled())
+        item = self.window.actions.item(0, 0)
+        item.setCheckState(Qt.CheckState.Unchecked)
+        self.assertFalse(self.window.save_button.isEnabled())
+        item.setCheckState(Qt.CheckState.Checked)
+        self.window.navigate_action(0, 0)
+        self.assertEqual(self.window.selector.currentText(), "乙")
+        destination = self.path.with_name("输出.xlsx")
+        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(destination), "")):
+            self.window.save_aligned()
+        self.wait_until(lambda: self.window.job is None)
+        self.assertTrue(destination.exists(), self.window.summary.text())
+        self.assertIn("已保存并验证", self.window.summary.text())
+        self.assertIsNone(self.window.staging)
+
+    def test_subset_regeneration_and_identical_state(self):
+        book = Workbook()
+        base = ["收入", "成本", "利润", "现金", "期末"]
+        for i, labels in enumerate((base, [x for x in base if x != "成本"],
+                                    ["收入", "利润", "成本", "现金", "期末"])):
+            ws = book.active if i == 0 else book.create_sheet(str(i))
+            ws["B4"] = "项目名称"
+            for row, label in enumerate(labels, 5):
+                ws.cell(row, 2, label)
+        book.save(self.path)
+        book.close()
+        self.window.load_file(self.path)
+        self.wait_until(lambda: self.window.open_button.isEnabled())
+        self.window.start_analysis()
+        self.wait_until(lambda: self.window.job is None)
+        self.assertFalse(self.window.save_button.isEnabled())
+        self.window.members.item(2, 0).setCheckState(Qt.CheckState.Unchecked)
+        self.assertTrue(self.window.regenerate_button.isEnabled())
+        self.window.regenerate_plan()
+        self.wait_until(lambda: self.window.job is None)
+        self.assertEqual(self.window.analysis['groups'][0]['sheets'], ['Sheet', '1'])
+        self.assertEqual(self.window.actions.rowCount(), 1)
+        self.assertTrue(self.window.save_button.isEnabled())
+        self.window.members.item(1, 0).setCheckState(Qt.CheckState.Unchecked)
+        self.assertFalse(self.window.regenerate_button.isEnabled())
+        self.assertFalse(self.window.save_button.isEnabled())
+
+    def test_identical_group_disables_save(self):
+        book = Workbook()
+        for ws in (book.active, book.create_sheet('相同')):
+            ws.append(['项目名称'])
+            for label in ['收入', '成本', '利润']:
+                ws.append([label])
+        book.save(self.path)
+        book.close()
+        self.window.load_file(self.path)
+        self.wait_until(lambda: self.window.open_button.isEnabled())
+        self.window.start_analysis()
+        self.wait_until(lambda: self.window.job is None)
+        self.assertIn('结构一致', self.window.summary.text())
+        self.assertFalse(self.window.save_button.isEnabled())
+
+    def test_alignment_cancel_cleans_staging(self):
+        self.window.job = "apply"
+        self.window.job_failure = None
+        self.window.staging = self.path.with_name(".alignment-test.xlsx")
+        self.window.staging.touch()
+        staging = self.window.staging
+        self.window.worker.start(sys.executable, ["-c", "import time; time.sleep(60)"])
+        self.assertTrue(self.window.worker.waitForStarted(3000))
+        self.window.cancel_job("已取消")
+        self.wait_until(lambda: self.window.job is None)
+        self.assertFalse(staging.exists())
+        self.assertIn("已取消", self.window.summary.text())
+
     def test_close_stops_worker_without_error_dialog(self):
         self.window.process.start(sys.executable, ["-c", "import time; time.sleep(60)"])
         self.assertTrue(self.window.process.waitForStarted(3000))
