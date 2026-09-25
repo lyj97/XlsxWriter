@@ -182,6 +182,34 @@ class QtTests(WorkbookFixture, unittest.TestCase):
         self.wait_until(lambda: self.window.open_button.isEnabled())
         self.assertEqual(self.window.selector.count(), 3)
 
+    def test_search_current_sheet_and_cycle_matches(self):
+        self.window.sheets = [{
+            "name": "搜索测试",
+            "rows": [["Alpha", "other"], ["x", "ALPHA"], ["none"]],
+            "columns": 2,
+        }]
+        self.window.search.setEnabled(True)
+        self.window.show_sheet(0)
+
+        self.window.search.setText("alpha")
+        self.assertEqual(self.window.search_matches, [(0, 0), (1, 1)])
+        self.assertEqual(self.window.search_result.text(), "1 / 2")
+        self.assertEqual((self.window.table.currentIndex().row(),
+                          self.window.table.currentIndex().column()), (0, 0))
+
+        self.window.next_search_match()
+        self.assertEqual(self.window.search_result.text(), "2 / 2")
+        self.assertEqual((self.window.table.currentIndex().row(),
+                          self.window.table.currentIndex().column()), (1, 1))
+        self.window.next_search_match()
+        self.assertEqual(self.window.search_result.text(), "1 / 2")
+        self.window.previous_search_match()
+        self.assertEqual(self.window.search_result.text(), "2 / 2")
+
+        self.window.search.setText("missing")
+        self.assertEqual(self.window.search_result.text(), "无匹配")
+        self.assertFalse(self.window.search_next.isEnabled())
+
     def test_cancel_and_timeout_stop_worker(self):
         # Substitute a slow Python child so the timer test is deterministic.
         for action, expected in [(self.window.cancel_load, "已取消"),

@@ -7,10 +7,11 @@ from pathlib import Path
 import sys
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QProcess, Qt, QTimer
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QFileDialog, QHBoxLayout,
-    QLabel, QMainWindow, QMessageBox, QPushButton, QTableView, QVBoxLayout,
-    QWidget, QSplitter, QTableWidget, QTableWidgetItem, QTextEdit,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QTableView,
+    QVBoxLayout, QWidget, QSplitter, QTableWidget, QTableWidgetItem, QTextEdit,
 )
 
 
@@ -67,6 +68,19 @@ class Viewer(QMainWindow):
         self.selector = QComboBox()
         self.selector.setMinimumWidth(200)
         self.selector.setEnabled(False)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索当前工作表…")
+        self.search.setClearButtonEnabled(True)
+        self.search.setEnabled(False)
+        self.search.setMinimumWidth(180)
+        self.search_previous = QPushButton("上一个")
+        self.search_next = QPushButton("下一个")
+        self.search_previous.setEnabled(False)
+        self.search_next.setEnabled(False)
+        self.search_result = QLabel("输入关键词")
+        self.search_result.setMinimumWidth(70)
+        self.search_matches = []
+        self.search_position = -1
         self.table = QTableView()
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setWordWrap(False)
@@ -79,6 +93,11 @@ class Viewer(QMainWindow):
         controls.addWidget(self.cancel_button)
         controls.addWidget(QLabel("工作表："))
         controls.addWidget(self.selector)
+        controls.addWidget(QLabel("搜索："))
+        controls.addWidget(self.search)
+        controls.addWidget(self.search_previous)
+        controls.addWidget(self.search_next)
+        controls.addWidget(self.search_result)
         controls.addStretch()
         layout = QVBoxLayout()
         layout.addLayout(controls)
@@ -164,6 +183,11 @@ class Viewer(QMainWindow):
         self.open_button.clicked.connect(self.choose_file)
         self.cancel_button.clicked.connect(self.cancel_load)
         self.selector.currentIndexChanged.connect(self.show_sheet)
+        self.search.textChanged.connect(self.update_search)
+        self.search.returnPressed.connect(self.next_search_match)
+        self.search_previous.clicked.connect(self.previous_search_match)
+        self.search_next.clicked.connect(self.next_search_match)
+        QShortcut(QKeySequence.StandardKey.Find, self, activated=self.search.setFocus)
 
     def choose_file(self):
         filename, _ = QFileDialog.getOpenFileName(
@@ -189,6 +213,8 @@ class Viewer(QMainWindow):
         self.cancel_button.setEnabled(True)
         self.selector.clear()
         self.selector.setEnabled(False)
+        self.search.clear()
+        self.search.setEnabled(False)
         self.sheets = []
         self.table.setModel(None)
         self.model = None
@@ -241,6 +267,7 @@ class Viewer(QMainWindow):
             return
         self.selector.addItems([sheet["name"] for sheet in self.sheets])
         self.selector.setEnabled(True)
+        self.search.setEnabled(True)
         self.analyze_button.setEnabled(True)
         self.setWindowTitle(f"{Path(self.filename).name} — Excel 结构对齐工具")
 
@@ -253,6 +280,42 @@ class Viewer(QMainWindow):
         rows, columns = len(sheet["rows"]), sheet["columns"]
         detail = f"{rows} 行 × {columns} 列" if rows else "空工作表"
         self.status.setText(f"{sheet['name']}：{detail}。只读；公式显示为文本。")
+        self.update_search()
+
+    def update_search(self):
+        query = self.search.text().casefold()
+        self.search_matches = []
+        self.search_position = -1
+        if query and self.model:
+            for row_number, row in enumerate(self.model.sheet["rows"]):
+                for column_number, value in enumerate(row):
+                    if query in value.casefold():
+                        self.search_matches.append((row_number, column_number))
+        enabled = bool(self.search_matches)
+        self.search_previous.setEnabled(enabled)
+        self.search_next.setEnabled(enabled)
+        if enabled:
+            self.search_position = 0
+            self._show_search_match()
+        else:
+            self.search_result.setText("无匹配" if query else "输入关键词")
+
+    def previous_search_match(self):
+        if self.search_matches:
+            self.search_position = (self.search_position - 1) % len(self.search_matches)
+            self._show_search_match()
+
+    def next_search_match(self):
+        if self.search_matches:
+            self.search_position = (self.search_position + 1) % len(self.search_matches)
+            self._show_search_match()
+
+    def _show_search_match(self):
+        row, column = self.search_matches[self.search_position]
+        index = self.model.index(row, column)
+        self.table.setCurrentIndex(index)
+        self.table.scrollTo(index)
+        self.search_result.setText(f"{self.search_position + 1} / {len(self.search_matches)}")
 
     def start_analysis(self):
         self.analysis = None
